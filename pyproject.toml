@@ -1,5 +1,5 @@
 [project]
-name = "mcp-filesystem"
+name = "mcp-filesystem-safurrier"
 version = "0.2.0"
 description = "MCP server for filesystem search and manipulation with granular search, content search and file edits"
 authors = [
