@@ -3,98 +3,133 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
-    
-    # uv2nix for Python package management
-    uv2nix = {
-      url = "github:adisbladis/uv2nix";
+
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    
-    # pyproject-nix for build system integration
-    pyproject-nix = {
-      url = "github:nix-community/pyproject.nix";
+
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = inputs@{ flake-parts, ... }:
-    flake-parts.lib.mkFlake { inherit inputs; } {
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      
-      perSystem = { config, self', inputs', pkgs, lib, system, ... }: 
-      let
-        workspace = inputs.uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
-        overlay = workspace.mkPyprojectOverlay {
-          sourcePreference = "wheel";  # Use wheels when available for faster builds
-        };
-        pyprojectOverrides = import inputs.pyproject-nix {
-          inherit pkgs;
-        };
-        python = pkgs.python312;
-        pythonSet = python.pkgs.overrideScope (
-          lib.composeExtensions overlay pyprojectOverrides.overrides
-        );
-      in {
-        packages = {
-          default = pythonSet.mcp-filesystem;
-          mcp-filesystem = pythonSet.mcp-filesystem;
-        };
+  outputs = {
+    self,
+    nixpkgs,
+    uv2nix,
+    pyproject-nix,
+    pyproject-build-systems,
+    ...
+  }: let
+    inherit (nixpkgs) lib;
 
-        apps = {
-          default = {
-            type = "app";
-            program = "${self'.packages.default}/bin/mcp-filesystem";
-          };
-          mcp-filesystem = {
-            type = "app";
-            program = "${self'.packages.mcp-filesystem}/bin/mcp-filesystem";
-          };
-        };
+    # Load a uv workspace from a workspace root.
+    workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
 
-        devShells.default = pkgs.mkShell {
-          buildInputs = [
-            pkgs.uv
-            python
-            pkgs.git
-            pkgs.ripgrep  # Required for optimal filesystem search performance
-          ];
-          
-          shellHook = ''
-            echo "=== MCP Filesystem Server Development Environment ==="
-            echo "Python: $(python --version)"
-            echo "UV: $(uv --version)"
-            echo "Ripgrep: $(rg --version | head -1)"
-            echo
-            echo "Development commands:"
-            echo "  uv sync              # Install dependencies"
-            echo "  uv run run_server.py # Run the MCP server"
-            echo "  uv run -m pytest    # Run tests"
-            echo "  uv run -m ruff check # Lint code"
-            echo
-            echo "MCP Server ready for development!"
-          '';
-        };
-
-        checks = {
-          # Build the package to ensure it works
-          build = self'.packages.default;
-          
-          # Run tests if available
-          pytest = pkgs.runCommand "mcp-filesystem-tests" 
-            { 
-              buildInputs = [ 
-                pythonSet.mcp-filesystem 
-                pythonSet.pytest 
-                pythonSet.pytest-asyncio
-                pythonSet.pytest-cov
-              ]; 
-            } ''
-            cd ${./.}
-            python -m pytest tests/ || echo "Tests failed, but package builds"
-            touch $out
-          '';
-        };
-      };
+    # Create package overlay from workspace.
+    overlay = workspace.mkPyprojectOverlay {
+      sourcePreference = "wheel"; # Prefer prebuilt binary wheels
     };
+
+    # Extend generated overlay with build fixups
+    pyprojectOverrides = _final: _prev: {
+      # Build fixups for mcp-filesystem if needed
+    };
+
+    # Support multiple systems
+    systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+    forAllSystems = lib.genAttrs systems;
+
+  in {
+    packages = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      python = pkgs.python312;
+
+      # Construct package set
+      pythonSet = (pkgs.callPackage pyproject-nix.build.packages {
+        inherit python;
+      }).overrideScope (
+        lib.composeManyExtensions [
+          pyproject-build-systems.overlays.default
+          overlay
+          pyprojectOverrides
+        ]
+      );
+    in {
+      default = pythonSet.mkVirtualEnv "mcp-filesystem-env" workspace.deps.default;
+      mcp-filesystem = pythonSet.mkVirtualEnv "mcp-filesystem-env" workspace.deps.default;
+    });
+
+    apps = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      default = {
+        type = "app";
+        program = "${self.packages.${system}.default}/bin/mcp-filesystem";
+      };
+      mcp-filesystem = {
+        type = "app";
+        program = "${self.packages.${system}.mcp-filesystem}/bin/mcp-filesystem";
+      };
+      # Alternative entry point using run_server.py  
+      run-server = {
+        type = "app";
+        program = "${pkgs.writeShellScript "mcp-filesystem-run-server" ''
+          exec ${self.packages.${system}.default}/bin/python ${./.}/run_server.py "$@"
+        ''}";
+      };
+    });
+
+    devShells = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      python = pkgs.python312;
+    in {
+      default = pkgs.mkShell {
+        packages = with pkgs; [
+          python
+          uv
+          git
+          ripgrep  # Required for optimal filesystem search performance
+        ];
+        
+        env = {
+          UV_PYTHON_DOWNLOADS = "never";
+          UV_PYTHON = python.interpreter;
+        } // lib.optionalAttrs pkgs.stdenv.isLinux {
+          LD_LIBRARY_PATH = lib.makeLibraryPath pkgs.pythonManylinuxPackages.manylinux1;
+        };
+        
+        shellHook = ''
+          unset PYTHONPATH
+          echo "=== MCP Filesystem Server Development Environment ==="
+          echo "Python: $(python --version)"
+          echo "UV: $(uv --version)"
+          echo "Ripgrep: $(rg --version | head -1)"
+          echo
+          echo "Development commands:"
+          echo "  uv sync              # Install dependencies"
+          echo "  uv run run_server.py # Run the MCP server"
+          echo "  uv run -m pytest    # Run tests"
+          echo "  uv run -m ruff check # Lint code"
+          echo
+          echo "MCP Server ready for development!"
+        '';
+      };
+    });
+
+    checks = forAllSystems (system: {
+      # Build the package to ensure it works
+      build = self.packages.${system}.default;
+    });
+  };
 }
